@@ -1,4 +1,5 @@
 const OUTPUT_CHANNEL_SIZE: usize = 16;
+const MAX_MESSAGE_BODY_LENGTH: usize = 256;
 lazy_static! {
     static ref USER_NAME_REGEX: Regex = Regex::new("[A-Za-z\\s]{4,24}").unwrap();
 }
@@ -111,5 +112,66 @@ impl Hub {
 
         let user = User::new(client_id, username);
         self.users.write().await.insert(client_id, user.clone()); 
+
+        let user_output = UserOutput::new(client_id, username);
+        let other_users = self.users.read().await.values().filter_map(|user| {
+            if user.id != client.id {
+                Some(UserOutput::new(user.id, &user.name))
+            }
+            else {
+                None
+            }
+        }).collect();
+
+        let messages = self.feed.read().await.messages.iter().map(|message| {
+            MessageOutput::new(
+                message.id, 
+                UserOutput::new(message.user.id, &message.user.name),
+                &message.body, 
+                &message.created_at,
+            )
+        }).collect(); 
+
+        self.send_targeted(client_id, Output::Joined(JoinedOutput::new(
+            user_output.clone(), 
+            other_users, 
+            messages, 
+        )));
+
+        self.send_ignored(client_id, Output::UserJoined(UserJoined::new(user_output))).await;
+    }
+
+    async fn process_post(&self, client_id: Uuid, input: PostInput) {
+        let user = if let Some(user) = self.users.read().await.get(&client_id) {
+            user.clone()
+        }
+        else {
+            self.send_error(client_id, OutputError::NotJoined);
+            return; 
+        };
+
+        if input.body.is_empty() || input.body.len() > MAX_MESSAGE_BODY_LENGTH {
+            self.send_error(client_id, OutputError::InvalidMessageBody);
+            return; 
+        }
+
+        let message = Message::new(Uuid::new_v4(), user.clone(), &input.body, Utc::now());
+        self.feed.write().await.add_message(message.clone());
+
+        let message_output = MessageOutput::new(
+            message.id,
+            UserOutput::new(user.id, &user.name),
+            &message.body,
+            message.created_at,
+        );
+        self.send_targeted(
+            client_id,
+            Output::Posted(PostedOutput::new(message_output.clone())),
+        );
+        self.send_ignored(
+            client_id,
+            Output::UserPosted(UserPostedOutput::new(message_output)),
+        )
+        .await;
     }
 }
